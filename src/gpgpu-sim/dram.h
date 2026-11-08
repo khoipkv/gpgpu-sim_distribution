@@ -39,11 +39,13 @@
 #include <bitset>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 #include "delayqueue.h"
+#include "pim.h"
 
 #define READ 'R'  // define read and write states
 #define WRITE 'W'
@@ -73,6 +75,7 @@ class dram_req_t {
 struct bankgrp_t {
   unsigned int CCDLc;
   unsigned int RTPLc;
+  unsigned int RRDLc;  // activate to activate in the same bank group
 };
 
 struct bank_t {
@@ -140,6 +143,16 @@ class dram_t {
                             unsigned &act, unsigned &pre, unsigned &rd,
                             unsigned &wr, unsigned &wr_WB, unsigned &req) const;
 
+  // HBM-PIM: run a PIM program on this channel (see pim.h, dram_pim.cc).
+  // GPU traffic drains first; the channel serves no GPU request until the
+  // program finishes.
+  void pim_launch(std::shared_ptr<const pim_program> prog);
+  bool pim_busy() const;
+  unsigned long long pim_progress() const;
+  const pim_session *get_pim_session() const { return m_pim_sess; }
+  const pim_unit *get_pim_unit() const { return m_pim; }
+  void pim_print(FILE *fp) const;
+
   const memory_config *m_config;
 
  private:
@@ -155,11 +168,50 @@ class dram_t {
 
   bool issue_col_command(int j);
   bool issue_row_command(int j);
+  bool issue_refresh_command();
+  void dec_timing_counters();
+  void refresh_reset();
+
+  // HBM-PIM in-order controller (dram_pim.cc)
+  void pim_cycle();
+  bool pim_gpu_drained() const;
+  void pim_start_session();
+  bool pim_bank_idle(unsigned b) const;
+  bool pim_act_issuable(unsigned b);
+  bool pim_pre_issuable(unsigned b);
+  bool pim_col_issuable(const pim_req_t &r);
+  bool pim_issue_refresh();
+  bool pim_issue_command();
+  bool pim_issue_precharge();
+  void pim_issue_act(const pim_req_t &r);
+  void pim_issue_pre(unsigned b);
+  void pim_issue_col(const pim_req_t &r);
+  void pim_trace(const char *cmd, unsigned bank, unsigned row, unsigned col,
+                 int kind);
 
   unsigned int RRDc;
   unsigned int CCDc;
   unsigned int RTWc;  // read to write penalty applies across banks
   unsigned int WTRc;  // write to read penalty applies across banks
+  unsigned int RFCc;  // refresh cycle in progress, no activate allowed
+
+  // refresh (only modeled when tREFI > 0). Ranks are refreshed in turn,
+  // staggered by tREFI/ranks as in DRAMSim2; only rank 0 holds banks, the
+  // other ranks just take a command slot for their refresh.
+  std::vector<unsigned> refresh_countdown;
+  unsigned refresh_next_rank;
+  bool refresh_pending;
+  unsigned refresh_pending_rank;
+
+  unsigned long long m_dram_cycle;
+  // requests in rwq (fifo_pipeline::get_n_element() also counts the delay
+  // bubbles the queue starts with)
+  unsigned m_rwq_requests;
+
+  // HBM-PIM
+  pim_unit *m_pim;
+  pim_session *m_pim_sess;
+  FILE *m_pim_trace_file;
 
   unsigned char
       rw;  // was last request a read or write? (important for RTW, WTR)

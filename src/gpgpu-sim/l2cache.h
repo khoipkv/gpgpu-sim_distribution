@@ -278,6 +278,15 @@ class memory_partition_unit {
 
   class gpgpu_sim *get_mgpu() const { return m_gpu; }
 
+  // HBM-PIM: run a PIM program on this channel's DRAM
+  void pim_launch(std::shared_ptr<const pim_program> prog) {
+    m_dram->pim_launch(prog);
+  }
+  const dram_t *get_dram() const { return m_dram; }
+  unsigned long long get_pim_gpu_stall_cycles() const {
+    return m_pim_gpu_stall_cycles;
+  }
+
  private:
   unsigned m_id;
   unsigned m_chiplet_id;
@@ -285,6 +294,8 @@ class memory_partition_unit {
   class memory_stats_t *m_stats;
   class memory_sub_partition **m_sub_partition;
   class dram_t *m_dram;
+  // DRAM cycles in which GPU requests waited for a PIM kernel
+  unsigned long long m_pim_gpu_stall_cycles;
 
   class arbitration_metadata {
    public:

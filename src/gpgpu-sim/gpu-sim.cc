@@ -336,6 +336,12 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(
       opp, "-dram_elimnate_rw_turnaround", OPT_BOOL, &elimnate_rw_turnaround,
       "elimnate_rw_turnaround i.e set tWTR and tRTW = 0", "0");
+  option_parser_register(
+      opp, "-gpgpu_dram_refresh_ranks", OPT_UINT32, &dram_refresh_ranks,
+      "number of ranks per channel refreshed in turn, staggered by "
+      "tREFI/ranks; only rank 0 holds banks, the other ranks just take a "
+      "command slot per refresh (only used when REFI > 0)",
+      "1");
   option_parser_register(opp, "-icnt_flit_size", OPT_UINT32, &icnt_flit_size,
                          "icnt_flit_size", "32");
   // SST mode activate
@@ -351,6 +357,7 @@ void memory_config::reg_options(class OptionParser *opp) {
       opp, "-gpgpu_lrc_max_merged", OPT_UINT32, &lrc_max_merged,
       "Maximum number of requests that can be merged in a single entry", "32");
   m_address_mapping.addrdec_setoption(opp);
+  m_pim_config.reg_options(opp);
 }
 
 void shader_core_config::reg_options(class OptionParser *opp) {
@@ -1411,6 +1418,9 @@ void gpgpu_sim::init() {
   gpu_sim_cycle = 0;
   gpu_sim_insn = 0;
   last_gpu_sim_insn = 0;
+  last_pim_progress = 0;
+  m_pim_sim_channels = 0;
+  m_pim_start_cycle = 0;
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
   partiton_reqs_in_parallel = 0;
@@ -2499,11 +2509,15 @@ void gpgpu_sim::cycle() {
     }
 
     if (!(gpu_sim_cycle % 50000)) {
-      // deadlock detection
-      if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
+      // deadlock detection (a running PIM kernel makes progress without
+      // retiring GPU instructions)
+      unsigned long long pim_prog = pim_progress();
+      if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn &&
+          pim_prog == last_pim_progress) {
         gpu_deadlock = true;
       } else {
         last_gpu_sim_insn = gpu_sim_insn;
+        last_pim_progress = pim_prog;
       }
     }
     try_snap_shot(gpu_sim_cycle);
@@ -2549,6 +2563,198 @@ void gpgpu_sim::perf_memcpy_to_gpu(size_t dst_start_addr, size_t count) {
           wr_addr, raw_addr.sub_partition, mask);
     }
   }
+}
+
+bool gpgpu_sim::launch_pim_kernel(const std::string &command) {
+  const pim_config &pcfg = m_memory_config->m_pim_config;
+  if (!pcfg.enabled) {
+    fprintf(stderr,
+            "GPGPU-Sim PIM: '%s' needs a config with -gpgpu_pim_enabled 1\n",
+            command.c_str());
+    return false;
+  }
+  if (pim_kernel_busy()) {
+    fprintf(stderr, "GPGPU-Sim PIM: a PIM kernel is already running\n");
+    return false;
+  }
+  pim_kernel_desc desc;
+  std::string error;
+  if (!parse_pim_kernel_command(command, desc, error)) {
+    fprintf(stderr, "GPGPU-Sim PIM: %s: %s\n", command.c_str(), error.c_str());
+    return false;
+  }
+  const unsigned n_mem = m_memory_config->m_n_mem;
+  const unsigned channels = desc.channels ? desc.channels : n_mem;
+  const unsigned sim_channels =
+      desc.sim_channels ? desc.sim_channels : std::min(channels, n_mem);
+  if (sim_channels > n_mem || sim_channels > channels) {
+    fprintf(stderr,
+            "GPGPU-Sim PIM: %s: sim_channels must not exceed channels (%u) or "
+            "the number of DRAM channels (%u)\n",
+            command.c_str(), channels, n_mem);
+    return false;
+  }
+  std::shared_ptr<const pim_program> prog = build_pim_program(
+      desc, pcfg, m_memory_config->nbk, m_memory_config->nbkgrp, n_mem, error);
+  if (!prog) {
+    fprintf(stderr, "GPGPU-Sim PIM: %s: %s\n", command.c_str(), error.c_str());
+    return false;
+  }
+
+  m_pim_program = prog;
+  m_pim_sim_channels = sim_channels;
+  m_pim_start_cycle = gpu_tot_sim_cycle + gpu_sim_cycle;
+  // reported like a kernel: name and uid show up in the stats printout
+  unsigned uid = gpgpu_ctx->kernel_info_m_next_uid++;
+  m_executed_kernel_names.push_back(prog->name);
+  m_executed_kernel_uids.push_back(uid);
+  printf(
+      "GPGPU-Sim PIM: launching %s (uid %u): data on %u channels, simulating "
+      "%u, %llu transactions per channel\n",
+      prog->name.c_str(), uid, channels, sim_channels, prog->total_cmds());
+  for (unsigned ch = 0; ch < sim_channels; ch++)
+    m_memory_partition_unit[ch]->pim_launch(prog);
+  return true;
+}
+
+bool gpgpu_sim::pim_kernel_busy() const {
+  for (unsigned ch = 0; ch < m_pim_sim_channels; ch++)
+    if (m_memory_partition_unit[ch]->get_dram()->pim_busy()) return true;
+  return false;
+}
+
+unsigned long long gpgpu_sim::pim_progress() const {
+  if (!m_memory_config->m_pim_config.enabled) return 0;
+  unsigned long long progress = 0;
+  for (unsigned ch = 0; ch < m_memory_config->m_n_mem; ch++)
+    progress += m_memory_partition_unit[ch]->get_dram()->pim_progress();
+  return progress;
+}
+
+void gpgpu_sim::print_pim_kernel_stats() {
+  if (!m_pim_program) return;
+  const pim_program &prog = *m_pim_program;
+  unsigned long long start = ~0ull, end = 0, stall = 0;
+  unsigned long long trans_min = ~0ull, trans_max = 0;
+  pim_stats sum;
+  bool all_finished = true, final_sb = true;
+  for (unsigned ch = 0; ch < m_pim_sim_channels; ch++) {
+    const dram_t *dram = m_memory_partition_unit[ch]->get_dram();
+    const pim_session *s = dram->get_pim_session();
+    if (!s->finished) {
+      all_finished = false;
+      continue;
+    }
+    start = std::min(start, s->start_dram_cycle);
+    end = std::max(end, s->end_dram_cycle);
+    trans_min = std::min(trans_min, s->transactions);
+    trans_max = std::max(trans_max, s->transactions);
+    if (dram->get_pim_unit()->mode() != pim_mode::SB) final_sb = false;
+    stall += m_memory_partition_unit[ch]->get_pim_gpu_stall_cycles();
+    const pim_stats &k = s->kernel_stats;
+    for (int i = 0; i < 3; i++) sum.mode_cycles[i] += k.mode_cycles[i];
+    sum.n_act += k.n_act;
+    sum.n_pre += k.n_pre;
+    sum.n_rd += k.n_rd;
+    sum.n_wr += k.n_wr;
+    sum.n_allbank_act += k.n_allbank_act;
+    sum.n_allbank_pre += k.n_allbank_pre;
+    sum.n_allbank_rd += k.n_allbank_rd;
+    sum.n_allbank_wr += k.n_allbank_wr;
+    sum.n_ref += k.n_ref;
+    sum.n_ref_other_rank += k.n_ref_other_rank;
+    sum.n_pim_cmds += k.n_pim_cmds;
+    sum.n_reserved_cmds += k.n_reserved_cmds;
+    for (int i = 0; i < PIM_NUM_CMD_TYPES; i++) {
+      sum.crf_visits[i] += k.crf_visits[i];
+      sum.block_ops[i] += k.block_ops[i];
+    }
+    sum.mac_lane_ops += k.mac_lane_ops;
+    sum.crf_writes += k.crf_writes;
+    sum.grf_a_writes += k.grf_a_writes;
+    sum.ctrl_writes += k.ctrl_writes;
+    sum.sb_to_hab += k.sb_to_hab;
+    sum.hab_to_hab_pim += k.hab_to_hab_pim;
+    sum.hab_pim_to_hab += k.hab_pim_to_hab;
+    sum.hab_to_sb += k.hab_to_sb;
+    sum.pim_off_before_exit += k.pim_off_before_exit;
+    sum.blocked_cycles += k.blocked_cycles;
+  }
+  const unsigned nch = m_pim_sim_channels;
+  const unsigned long long dram_cycles = all_finished ? end - start + 1 : 0;
+  const double seconds = dram_cycles * m_config.dram_period;
+
+  printf(
+      "\n----------------------------PIM-kernel-stats-----------------------"
+      "\n");
+  printf("pim_kernel_name = %s\n", prog.name.c_str());
+  printf("pim_kernel_finished = %d\n", all_finished);
+  printf("pim_kernel_sim_channels = %u\n", nch);
+  printf("pim_kernel_dram_cycles = %llu\n", dram_cycles);
+  printf("pim_kernel_core_cycles = %llu\n",
+         gpu_tot_sim_cycle + gpu_sim_cycle - m_pim_start_cycle);
+  printf("pim_kernel_time_us = %.4f\n", seconds * 1e6);
+  printf("pim_kernel_transactions_per_channel = %llu\n", trans_max);
+  printf("pim_kernel_n_act = %llu\n", sum.n_act);
+  printf("pim_kernel_n_pre = %llu\n", sum.n_pre);
+  printf("pim_kernel_n_rd = %llu\n", sum.n_rd);
+  printf("pim_kernel_n_wr = %llu\n", sum.n_wr);
+  printf("pim_kernel_n_ref = %llu\n", sum.n_ref);
+  printf("pim_kernel_n_ref_other_rank = %llu\n", sum.n_ref_other_rank);
+  printf("pim_kernel_blocked_cycles = %llu\n", sum.blocked_cycles);
+  printf("pim_gpu_stall_cycles_total = %llu\n", stall);
+  if (seconds > 0)
+    printf("pim_kernel_dram_bw_GBps = %.4f\n",
+           (sum.n_rd + sum.n_wr) * 32.0 / seconds / 1e9);
+
+  bool pass =
+      all_finished && trans_min == trans_max && trans_max == prog.expected_cmds;
+  if (prog.is_pim) {
+    const unsigned long long nb = m_memory_config->m_pim_config.num_blocks;
+    printf("pim_kernel_cycles_sb = %llu\n", sum.mode_cycles[0] / nch);
+    printf("pim_kernel_cycles_hab = %llu\n", sum.mode_cycles[1] / nch);
+    printf("pim_kernel_cycles_hab_pim = %llu\n", sum.mode_cycles[2] / nch);
+    printf("pim_kernel_allbank_act = %llu\n", sum.n_allbank_act);
+    printf("pim_kernel_allbank_pre = %llu\n", sum.n_allbank_pre);
+    printf("pim_kernel_allbank_rd = %llu\n", sum.n_allbank_rd);
+    printf("pim_kernel_allbank_wr = %llu\n", sum.n_allbank_wr);
+    printf("pim_kernel_pim_cmds = %llu\n", sum.n_pim_cmds);
+    printf("pim_kernel_reserved_row_cmds = %llu\n", sum.n_reserved_cmds);
+    for (unsigned t = 0; t < PIM_NUM_CMD_TYPES; t++) {
+      if (!sum.crf_visits[t]) continue;
+      printf("pim_kernel_crf_%s = %llu\n", pim_cmd_type_str(t),
+             sum.crf_visits[t]);
+    }
+    printf("pim_kernel_mac_lane_ops = %llu\n", sum.mac_lane_ops);
+    printf("pim_kernel_crf_writes = %llu\n", sum.crf_writes);
+    printf("pim_kernel_grf_a_writes = %llu\n", sum.grf_a_writes);
+    printf(
+        "pim_kernel_mode_changes = SB->HAB:%llu HAB->HAB_PIM:%llu "
+        "HAB_PIM->HAB:%llu HAB->SB:%llu\n",
+        sum.sb_to_hab, sum.hab_to_hab_pim, sum.hab_pim_to_hab, sum.hab_to_sb);
+    printf("pim_kernel_pim_off_before_exit = %llu\n", sum.pim_off_before_exit);
+    if (seconds > 0)
+      printf("pim_kernel_internal_bw_GBps = %.4f\n",
+             sum.n_pim_cmds * nb * 32.0 / seconds / 1e9);
+
+    // closed-form checks (PIMKernel command counts, mode sequence)
+    bool pim_ok = sum.n_pim_cmds == prog.expected_pim_cmds * nch;
+    bool modes_ok = final_sb && sum.sb_to_hab == nch && sum.hab_to_sb == nch &&
+                    sum.hab_to_hab_pim == prog.expected_pim_on * nch;
+    printf("pim_kernel_check_transactions = %s (%llu, expected %llu)\n",
+           trans_max == prog.expected_cmds ? "PASS" : "FAIL", trans_max,
+           prog.expected_cmds);
+    printf("pim_kernel_check_pim_cmds = %s (%llu, expected %llu)\n",
+           pim_ok ? "PASS" : "FAIL", sum.n_pim_cmds / (nch ? nch : 1),
+           prog.expected_pim_cmds);
+    printf("pim_kernel_check_modes = %s\n", modes_ok ? "PASS" : "FAIL");
+    pass = pass && pim_ok && modes_ok;
+  }
+  if (m_memory_config->m_pim_config.selfcheck)
+    printf("pim_kernel_selfcheck = %s\n", pass ? "PASS" : "FAIL");
+  printf(
+      "----------------------------END-of-PIM-kernel-stats----------------\n");
+  m_pim_program.reset();
 }
 
 void gpgpu_sim::dump_pipeline(int mask, int s, int m) const {

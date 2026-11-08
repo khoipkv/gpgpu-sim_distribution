@@ -43,6 +43,7 @@
 #include "addrdec.h"
 #include "gpu-cache.h"
 #include "l2cache.h"
+#include "pim_config.h"
 #include "shader.h"
 
 // constants for statistics printouts
@@ -227,6 +228,13 @@ class memory_config {
       nbkgrp = 1;
       tCCDL = 0;
       tRTPL = 0;
+      // timings only available as named options keep their "derive" default
+      tRRDL = 0;
+      tRCDWR_opt = 0;
+      tRTW_opt = 0;
+      tRTP_opt = 0;
+      tREFI = 0;
+      tRFC = 0;
       sscanf(gpgpu_dram_timing_opt, "%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d",
              &nbk, &tCCD, &tRRD, &tRCD, &tRAS, &tRP, &tRC, &CL, &WL, &tCDLR,
              &tWR, &nbkgrp, &tCCDL, &tRTPL);
@@ -271,6 +279,28 @@ class memory_config {
           "read to precharge delay between accesses to different bank groups",
           "0");
 
+      // Optional timings, 0 keeps the derived/legacy behavior
+      option_parser_register(
+          dram_opp, "RRDL", OPT_UINT32, &tRRDL,
+          "activate to activate delay within the same bank group (tRRD_L); "
+          "RRD is then tRRD_S",
+          "0");
+      option_parser_register(dram_opp, "RCDWR", OPT_UINT32, &tRCDWR_opt,
+                             "row to column delay for writes (default: "
+                             "derived as RCD-(WL+1))",
+                             "0");
+      option_parser_register(dram_opp, "RTW", OPT_UINT32, &tRTW_opt,
+                             "read to write turnaround (default: derived as "
+                             "CL+BL/ratio+2-WL)",
+                             "0");
+      option_parser_register(
+          dram_opp, "RTP", OPT_UINT32, &tRTP_opt,
+          "read to precharge delay in the same bank (default: BL/ratio)", "0");
+      option_parser_register(dram_opp, "REFI", OPT_UINT32, &tREFI,
+                             "refresh interval (0 = refresh not modeled)", "0");
+      option_parser_register(dram_opp, "RFC", OPT_UINT32, &tRFC,
+                             "refresh cycle time", "0");
+
       option_parser_delimited_string(dram_opp, gpgpu_dram_timing_opt, "=:;");
       fprintf(stdout, "DRAM Timing Options:\n");
       option_parser_print(dram_opp, stdout);
@@ -284,15 +314,17 @@ class memory_config {
     }
     bk_tag_length = i - 1;
     assert(nbkgrp > 0 && "Number of bank groups cannot be zero");
-    tRCDWR = tRCD - (WL + 1);
+    tRCDWR = tRCDWR_opt ? tRCDWR_opt : tRCD - (WL + 1);
     if (elimnate_rw_turnaround) {
       tRTW = 0;
       tWTR = 0;
     } else {
-      tRTW = (CL + (BL / data_command_freq_ratio) + 2 - WL);
+      tRTW =
+          tRTW_opt ? tRTW_opt : (CL + (BL / data_command_freq_ratio) + 2 - WL);
       tWTR = (WL + (BL / data_command_freq_ratio) + tCDLR);
     }
     tWTP = (WL + (BL / data_command_freq_ratio) + tWR);
+    tRTP = tRTP_opt ? tRTP_opt : BL / data_command_freq_ratio;
     dram_atom_size =
         BL * busW * gpu_n_mem_per_ctrlr;  // burst length x bus width x # chips
                                           // per partition
@@ -318,6 +350,8 @@ class memory_config {
     sscanf(write_queue_size_opt, "%d:%d:%d",
            &gpgpu_frfcfs_dram_write_queue_size, &write_high_watermark,
            &write_low_watermark);
+
+    m_pim_config.init(this);
   }
   void reg_options(class OptionParser *opp);
 
@@ -430,6 +464,21 @@ class memory_config {
   unsigned lrc_max_entries;
   unsigned lrc_max_merged;
   gpgpu_context *gpgpu_ctx;
+
+  // Optional DRAM timings (named -gpgpu_dram_timing_opt keys); kept at the
+  // end of the class so existing member layout is unchanged
+  unsigned tRRDL;       // ACT to ACT in the same bank group, 0 = disabled
+  unsigned tRCDWR_opt;  // 0 = derive tRCDWR
+  unsigned tRTW_opt;    // 0 = derive tRTW
+  unsigned tRTP_opt;    // 0 = derive tRTP
+  unsigned tRTP;        // read to precharge in the same bank
+  unsigned tREFI;       // refresh interval, 0 = refresh not modeled
+  unsigned tRFC;        // refresh cycle time
+  unsigned dram_refresh_ranks;  // ranks refreshed in turn (only rank 0 has
+                                // banks in this model)
+
+  // HBM-PIM (processing-in-memory) model
+  pim_config m_pim_config;
 };
 
 extern bool g_interactive_debugger_enabled;
@@ -660,6 +709,12 @@ class gpgpu_sim : public gpgpu_t {
 
   void perf_memcpy_to_gpu(size_t dst_start_addr, size_t count);
 
+  // HBM-PIM kernels ("PIMKernel,..." trace commands, see pim.h)
+  bool launch_pim_kernel(const std::string &command);
+  bool pim_kernel_busy() const;
+  unsigned long long pim_progress() const;
+  void print_pim_kernel_stats();
+
   // The next three functions added to be used by the functional simulation
   // function
 
@@ -782,6 +837,12 @@ class gpgpu_sim : public gpgpu_t {
   class power_stat_t *m_power_stats;
   class gpgpu_sim_wrapper *m_gpgpusim_wrapper;
   unsigned long long last_gpu_sim_insn;
+
+  // HBM-PIM kernel in flight
+  unsigned long long last_pim_progress;
+  std::shared_ptr<const pim_program> m_pim_program;
+  unsigned m_pim_sim_channels;
+  unsigned long long m_pim_start_cycle;
 
   unsigned long long last_liveness_message_time;
 

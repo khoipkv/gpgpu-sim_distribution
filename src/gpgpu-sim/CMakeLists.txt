@@ -1,6 +1,7 @@
 # Exclude power_interface.cc if no power model
 list(APPEND gpgpusim_SRC addrdec.cc
     dram.cc
+    dram_pim.cc
     dram_sched.cc
     gpu-cache.cc
     gpu-misc.cc
@@ -12,6 +13,7 @@ list(APPEND gpgpusim_SRC addrdec.cc
     local_interconnect.cc
     mem_fetch.cc
     mem_latency_stat.cc
+    pim.cc
     power_interface.cc
     power_stat.cc
     scoreboard.cc

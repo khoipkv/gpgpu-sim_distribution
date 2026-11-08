@@ -92,6 +92,7 @@ memory_partition_unit::memory_partition_unit(
   m_chiplet_id = partition_id / partitions_per_chiplet;
 
   m_dram = new dram_t(m_id, m_config, m_stats, this, gpu);
+  m_pim_gpu_stall_cycles = 0;
 
   m_sub_partition = new memory_sub_partition
       *[m_config->m_n_sub_partition_per_memory_channel];
@@ -206,6 +207,7 @@ bool memory_partition_unit::busy() const {
       busy = true;
     }
   }
+  if (m_dram->pim_busy()) busy = true;
   return busy;
 }
 
@@ -361,6 +363,17 @@ void memory_partition_unit::dram_cycle() {
 
   m_dram->cycle();
   m_dram->dram_log(SAMPLELOG);
+
+  if (m_dram->pim_busy()) {
+    // the channel drains and then runs a PIM kernel: GPU requests wait in the
+    // L2-to-DRAM and DRAM latency queues until it finishes
+    bool waiting = !m_dram_latency_queue.empty();
+    for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
+         p++)
+      if (!m_sub_partition[p]->L2_dram_queue_empty()) waiting = true;
+    if (waiting) m_pim_gpu_stall_cycles++;
+    return;
+  }
 
   // mem_fetch *mf = m_sub_partition[spid]->L2_dram_queue_top();
   // if( !m_dram->full(mf->is_write()) ) {

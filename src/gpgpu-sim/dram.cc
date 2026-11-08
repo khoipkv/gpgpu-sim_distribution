@@ -67,6 +67,8 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   banks_acess_total_after = 0;
   banks_time_ready = 0;
   banks_access_ready_total = 0;
+  banks_time_rw = 0;
+  banks_access_rw_total = 0;
   issued_two = 0;
   issued_total = 0;
   issued_total_row = 0;
@@ -76,6 +78,26 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   RRDc = 0;
   RTWc = 0;
   WTRc = 0;
+  RFCc = 0;
+  refresh_reset();
+  m_dram_cycle = 0;
+  m_rwq_requests = 0;
+
+  m_pim = NULL;
+  m_pim_sess = NULL;
+  m_pim_trace_file = NULL;
+  if (m_config->m_pim_config.enabled) {
+    m_pim = new pim_unit(&m_config->m_pim_config, m_config->nbk);
+    m_pim_sess = new pim_session();
+    const char *trace = m_config->m_pim_config.cmd_trace;
+    if (trace && trace[0] && id == m_config->m_pim_config.cmd_trace_ch) {
+      m_pim_trace_file = fopen(trace, "w");
+      if (!m_pim_trace_file) {
+        fprintf(stderr, "GPGPU-Sim PIM: cannot open %s\n", trace);
+        exit(1);
+      }
+    }
+  }
 
   wasted_bw_row = 0;
   wasted_bw_col = 0;
@@ -97,13 +119,14 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   rw = READ;  // read mode is default
 
   bkgrp = (bankgrp_t **)calloc(sizeof(bankgrp_t *), m_config->nbkgrp);
-  bkgrp[0] = (bankgrp_t *)calloc(sizeof(bank_t), m_config->nbkgrp);
+  bkgrp[0] = (bankgrp_t *)calloc(sizeof(bankgrp_t), m_config->nbkgrp);
   for (unsigned i = 1; i < m_config->nbkgrp; i++) {
     bkgrp[i] = bkgrp[0] + i;
   }
   for (unsigned i = 0; i < m_config->nbkgrp; i++) {
     bkgrp[i]->CCDLc = 0;
     bkgrp[i]->RTPLc = 0;
+    bkgrp[i]->RRDLc = 0;
   }
 
   bk = (bank_t **)calloc(sizeof(bank_t *), m_config->nbk);
@@ -130,6 +153,7 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   n_nop = 0;
   n_act = 0;
   n_pre = 0;
+  n_ref = 0;
   n_rd = 0;
   n_wr = 0;
   n_wr_WB = 0;
@@ -288,9 +312,29 @@ void dram_t::scheduler_fifo() {
   a ^= b;
 
 void dram_t::cycle() {
+  m_dram_cycle++;
+  if (m_pim_sess && m_pim_sess->phase == pim_session::DRAINING &&
+      pim_gpu_drained())
+    pim_start_session();
+
+  if (m_config->tREFI && refresh_countdown[refresh_next_rank] == 0) {
+    refresh_pending = true;
+    refresh_pending_rank = refresh_next_rank;
+    refresh_countdown[refresh_next_rank] = m_config->tREFI;
+    refresh_next_rank = (refresh_next_rank + 1) % refresh_countdown.size();
+  }
+
+  if (m_pim_sess && m_pim_sess->phase == pim_session::ACTIVE) {
+    // the channel runs a PIM program; GPU requests wait in the partition
+    pim_cycle();
+    dec_timing_counters();
+    return;
+  }
+
   if (!returnq->full()) {
     dram_req_t *cmd = rwq->pop();
     if (cmd) {
+      m_rwq_requests--;
 #ifdef DRAM_VIEWCMD
       printf("\tDQ: BK%d Row:%03x Col:%03x", cmd->bk, cmd->row,
              cmd->col + cmd->dqbytes);
@@ -406,6 +450,10 @@ void dram_t::cycle() {
 
   bool issued_col_cmd = false;
   bool issued_row_cmd = false;
+  // a pending refresh takes the row command slot (precharge open banks, then
+  // refresh); in single bus mode it is the only command issued this cycle
+  bool issued_ref_cmd = refresh_pending && issue_refresh_command();
+  issued_row_cmd = issued_ref_cmd;
 
   if (m_config->dual_bus_interface) {
     // dual bus interface
@@ -415,7 +463,7 @@ void dram_t::cycle() {
       issued_col_cmd = issue_col_command(j);
       if (issued_col_cmd) break;
     }
-    for (unsigned i = 0; i < m_config->nbk; i++) {
+    for (unsigned i = 0; i < m_config->nbk && !issued_ref_cmd; i++) {
       unsigned j = (i + prio) % m_config->nbk;
       issued_row_cmd = issue_row_command(j);
       if (issued_row_cmd) break;
@@ -434,7 +482,8 @@ void dram_t::cycle() {
     // issue only one row/column command
     for (unsigned i = 0; i < m_config->nbk; i++) {
       unsigned j = (i + prio) % m_config->nbk;
-      if (!issued_col_cmd) issued_col_cmd = issue_col_command(j);
+      if (!issued_col_cmd && !issued_ref_cmd)
+        issued_col_cmd = issue_col_command(j);
 
       if (!issued_col_cmd && !issued_row_cmd)
         issued_row_cmd = issue_row_command(j);
@@ -528,11 +577,20 @@ void dram_t::cycle() {
 
   /////////////////////////////////////////////////////////
 
-  // decrements counters once for each time dram_issueCMD is called
+  dec_timing_counters();
+
+#ifdef DRAM_VISUALIZE
+  visualize();
+#endif
+}
+
+// decrements counters once for each time dram_issueCMD is called
+void dram_t::dec_timing_counters() {
   DEC2ZERO(RRDc);
   DEC2ZERO(CCDc);
   DEC2ZERO(RTWc);
   DEC2ZERO(WTRc);
+  DEC2ZERO(RFCc);
   for (unsigned j = 0; j < m_config->nbk; j++) {
     DEC2ZERO(bk[j]->RCDc);
     DEC2ZERO(bk[j]->RASc);
@@ -545,11 +603,54 @@ void dram_t::cycle() {
   for (unsigned j = 0; j < m_config->nbkgrp; j++) {
     DEC2ZERO(bkgrp[j]->CCDLc);
     DEC2ZERO(bkgrp[j]->RTPLc);
+    DEC2ZERO(bkgrp[j]->RRDLc);
   }
+  if (m_config->tREFI)
+    for (unsigned &c : refresh_countdown) DEC2ZERO(c);
+}
 
-#ifdef DRAM_VISUALIZE
-  visualize();
-#endif
+void dram_t::refresh_reset() {
+  unsigned ranks =
+      m_config->dram_refresh_ranks ? m_config->dram_refresh_ranks : 1;
+  refresh_countdown.assign(ranks, 0);
+  for (unsigned r = 0; r < ranks; r++)
+    refresh_countdown[r] = (m_config->tREFI / ranks) * (r + 1);
+  refresh_next_rank = 0;
+  refresh_pending = false;
+  refresh_pending_rank = 0;
+}
+
+// Refresh: precharge every open bank, then refresh once all banks are idle.
+// Activates are held off while a refresh is pending (see issue_row_command).
+bool dram_t::issue_refresh_command() {
+  if (refresh_pending_rank != 0) {
+    // another rank: it holds no banks in this model, the refresh only takes
+    // the command slot
+    refresh_pending = false;
+    n_ref++;
+    return true;
+  }
+  bool all_idle = true;
+  for (unsigned j = 0; j < m_config->nbk; j++) {
+    unsigned grp = get_bankgrp_number(j);
+    if (bk[j]->state == BANK_ACTIVE) {
+      all_idle = false;
+      if (!bk[j]->RASc && !bk[j]->WTPc && !bk[j]->RTPc && !bkgrp[grp]->RTPLc) {
+        bk[j]->state = BANK_IDLE;
+        bk[j]->RPc = m_config->tRP;
+        n_pre++;
+        n_pre_partial++;
+        return true;
+      }
+    } else if (bk[j]->RPc) {
+      all_idle = false;
+    }
+  }
+  if (!all_idle) return false;
+  RFCc = m_config->tRFC;
+  refresh_pending = false;
+  n_ref++;
+  return true;
 }
 
 bool dram_t::issue_col_command(int j) {
@@ -567,11 +668,12 @@ bool dram_t::issue_col_command(int j) {
         rwq->set_min_length(m_config->CL);
       }
       rwq->push(bk[j]->mrq);
+      m_rwq_requests++;
       bk[j]->mrq->txbytes += m_config->dram_atom_size;
       CCDc = m_config->tCCD;
       bkgrp[grp]->CCDLc = m_config->tCCDL;
       RTWc = m_config->tRTW;
-      bk[j]->RTPc = m_config->BL / m_config->data_command_freq_ratio;
+      bk[j]->RTPc = m_config->tRTP;
       bkgrp[grp]->RTPLc = m_config->tRTPL;
       issued = true;
       if (bk[j]->mrq->data->get_access_type() == L2_WR_ALLOC_R)
@@ -602,6 +704,7 @@ bool dram_t::issue_col_command(int j) {
           rwq->set_min_length(m_config->WL);
         }
         rwq->push(bk[j]->mrq);
+        m_rwq_requests++;
 
         bk[j]->mrq->txbytes += m_config->dram_atom_size;
         CCDc = m_config->tCCD;
@@ -641,7 +744,7 @@ bool dram_t::issue_row_command(int j) {
     //     bank is idle
     // else
     if (!issued && !RRDc && (bk[j]->state == BANK_IDLE) && !bk[j]->RPc &&
-        !bk[j]->RCc) {  //
+        !bk[j]->RCc && !bkgrp[grp]->RRDLc && !RFCc && !refresh_pending) {  //
 #ifdef DRAM_VERIFY
       PRINT_CYCLE = 1;
       printf("\tACT BK:%d NewRow:%03x From:%03x \n", j, bk[j]->mrq->row,
@@ -651,6 +754,7 @@ bool dram_t::issue_row_command(int j) {
       bk[j]->curr_row = bk[j]->mrq->row;
       bk[j]->state = BANK_ACTIVE;
       RRDc = m_config->tRRD;
+      bkgrp[grp]->RRDLc = m_config->tRRDL;
       bk[j]->RCDc = m_config->tRCD;
       bk[j]->RCDWRc = m_config->tRCDWR;
       bk[j]->RASc = m_config->tRAS;
@@ -777,6 +881,7 @@ void dram_t::print(FILE *simFile) const {
   if (m_config->scheduler_type == DRAM_FRFCFS)
     fprintf(simFile, "mrqq: max=%d avg=%g\n", max_mrqs,
             (float)ave_mrqs / n_cmd);
+  if (m_pim) pim_print(simFile);
 }
 
 void dram_t::visualize() const {
